@@ -1,0 +1,239 @@
+import torch
+import os
+import gc
+import argparse
+import biotite.structure.io as bsio
+import pandas as pd
+from tqdm import tqdm
+import math
+from Bio import SeqIO
+from transformers import AutoTokenizer, EsmForProteinFolding
+
+from transformers.models.esm.openfold_utils.protein import to_pdb, Protein as OFProtein
+from transformers.models.esm.openfold_utils.feats import atom14_to_atom37
+
+def read_fasta(file_path, key):
+    return str(getattr(SeqIO.read(file_path, 'fasta'), key))
+
+def read_multi_fasta(file_path):
+    """
+    params:
+        file_path: path to a fasta file
+    return:
+        a dictionary of sequences
+    """
+    sequences = {}
+    current_sequence = ''
+    with open(file_path, 'r') as file:
+        for line in file:
+            line = line.strip()
+            if line.startswith('>'):
+                if current_sequence:
+                    sequences[header] = current_sequence
+                    current_sequence = ''
+                header = line
+            else:
+                current_sequence += line
+        if current_sequence:
+            sequences[header] = current_sequence
+    return sequences
+
+def convert_outputs_to_pdb(outputs):
+    final_atom_positions = atom14_to_atom37(outputs["positions"][-1], outputs)
+    outputs = {k: v.to("cpu").numpy() for k, v in outputs.items()}
+    final_atom_positions = final_atom_positions.cpu().numpy()
+    final_atom_mask = outputs["atom37_atom_exists"]
+    pdbs = []
+    for i in range(outputs["aatype"].shape[0]):
+        aa = outputs["aatype"][i]
+        pred_pos = final_atom_positions[i]
+        mask = final_atom_mask[i]
+        resid = outputs["residue_index"][i] + 1
+        pred = OFProtein(
+            aatype=aa,
+            atom_positions=pred_pos,
+            atom_mask=mask,
+            residue_index=resid,
+            b_factors=outputs["plddt"][i],
+            chain_index=outputs["chain_index"][i] if "chain_index" in outputs else None,
+        )
+        pdbs.append(to_pdb(pred))
+    return pdbs
+
+def call_esmfold(fasta_dir, out_dir, fold_chunk_size=None, length_filter=10000):
+    tokenizer = AutoTokenizer.from_pretrained("facebook/esmfold_v1", padding=True, truncation=True)
+    model = EsmForProteinFolding.from_pretrained("facebook/esmfold_v1", low_cpu_mem_usage=True)
+
+    model = model.cuda()
+    # model.esm = model.esm.half()
+    torch.backends.cuda.matmul.allow_tf32 = True
+    # Optionally, uncomment to set a chunk size for axial attention. This can help reduce memory.
+    # Lower sizes will have lower memory requirements at the cost of increased speed.
+    if fold_chunk_size is not None:
+        model.trunk.set_chunk_size(fold_chunk_size)
+
+    plddt_scores = dict()
+    if fasta_dir is not None:
+        os.makedirs(out_dir, exist_ok=True)
+        # get skip file list
+        skip_files = list()
+        for template in os.listdir(out_dir):
+            if os.path.isdir(os.path.join(out_dir, template)):
+                skip_files.extend(os.listdir(os.path.join(out_dir, template)))
+            elif os.path.isfile(os.path.join(out_dir, template)):
+                skip_files.extend(os.path.join(out_dir, template))
+
+        
+        proteins = sorted(os.listdir(fasta_dir))
+        bar = tqdm(proteins)
+        # length filter
+        step_range = 100
+        length_stage = range(0, 2000, step_range)
+        frequency = [0]*len(length_stage)
+        print("seq len analysis...")
+        filtered_proteins = list()
+        for p in bar:
+            sequence = read_fasta(os.path.join(fasta_dir, p), "seq")
+            seq_len = len(sequence)
+            stage = min(math.floor(seq_len / step_range), len(length_stage)-1)
+            frequency[stage] += 1
+            if seq_len < length_filter:
+                filtered_proteins.append(p)
+        print("frequency: ")
+        print(length_stage)
+        print(frequency)
+        bar = tqdm(filtered_proteins)
+        for p in bar:
+            try:
+                name = p.split('.')[0]
+                bar.set_description(name)
+                out_file_name = name + ".pdb"
+                out_file = os.path.join(out_dir, out_file_name)
+                if os.path.isfile(out_file) or out_file_name in skip_files:
+                    print(f'skipping {name}')
+                    continue
+                bar.set_description(p)
+                sequence = read_fasta(os.path.join(fasta_dir, p), "seq")
+                tokenized_input = tokenizer([sequence], return_tensors="pt", add_special_tokens=False)['input_ids'].cuda()
+                # Multimer prediction can be done with chains separated by ':'
+
+                with torch.no_grad():
+                    output = model(tokenized_input)
+
+                pdb = convert_outputs_to_pdb(output)
+                with open(out_file, "w") as f:
+                    f.write("\n".join(pdb))
+
+                struct = bsio.load_structure(out_file, extra_fields=["b_factor"])
+                plddt_score = struct.b_factor.mean()
+                plddt_scores[name] = plddt_score
+                print(p, plddt_score)
+            except Exception as e:
+                print('esmfold error: ', e)
+                print('error while processing', p)
+    return plddt_scores
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--sequence", type=str, default=None)
+    parser.add_argument("--fasta_file", type=str, default=None)
+    parser.add_argument("--fasta_chunk_num", type=int, default=None)
+    parser.add_argument("--fasta_chunk_id", type=int, default=None)
+    parser.add_argument("--fasta_dir", type=str, default=None)
+    parser.add_argument("--out_dir", type=str)
+    parser.add_argument("--out_file", type=str, default="result.pdb")
+    parser.add_argument("--out_info_file", type=str, default=None)
+    parser.add_argument("--fold_chunk_size", type=int)
+    args = parser.parse_args()
+    
+    # model = esm.pretrained.esmfold_v1()
+    # model = model.eval().cuda()
+    
+    tokenizer = AutoTokenizer.from_pretrained("facebook/esmfold_v1")
+    model = EsmForProteinFolding.from_pretrained("facebook/esmfold_v1", low_cpu_mem_usage=True)
+
+    model = model.cuda()
+    # model.esm = model.esm.half()
+    torch.backends.cuda.matmul.allow_tf32 = True
+    # Optionally, uncomment to set a chunk size for axial attention. This can help reduce memory.
+    # Lower sizes will have lower memory requirements at the cost of increased speed.
+    if args.fold_chunk_size is not None:
+        model.trunk.set_chunk_size(args.fold_chunk_size)
+    
+    if args.fasta_file is not None:
+        seq_dict = read_multi_fasta(args.fasta_file)
+        os.makedirs(args.out_dir, exist_ok=True)
+        names, sequences = list(seq_dict.keys()), list(seq_dict.values())
+        if args.fasta_chunk_num is not None:
+            chunk_size = len(names) // args.fasta_chunk_num + 1
+            start = args.fasta_chunk_id * chunk_size
+            end = min((args.fasta_chunk_id + 1) * chunk_size, len(names))
+            names, sequences = names[start:end], sequences[start:end]
+        
+        out_info_dict = {"name": [], "plddt": []}
+        bar = tqdm(zip(names, sequences))
+        for name, sequence in bar:
+            bar.set_description(name)
+            out_file = os.path.join(args.out_dir, name[1:]+".pdb")
+            if os.path.exists(out_file):
+                out_info_dict["name"].append(name[1:])
+                struct = bsio.load_structure(out_file, extra_fields=["b_factor"])
+                out_info_dict["plddt"].append(struct.b_factor.mean())
+                continue
+            tokenized_input = tokenizer([sequence], return_tensors="pt", add_special_tokens=False)['input_ids'].cuda()
+            # Multimer prediction can be done with chains separated by ':'
+
+            with torch.no_grad():
+                output = model(tokenized_input)
+
+            gc.collect()
+            
+            
+            pdb = convert_outputs_to_pdb(output)
+            with open(out_file, "w") as f:
+                f.write("\n".join(pdb))
+                
+            out_info_dict["name"].append(name[1:])
+            struct = bsio.load_structure(out_file, extra_fields=["b_factor"])
+            out_info_dict["plddt"].append(struct.b_factor.mean())
+        
+        if args.out_info_file is not None:
+            pd.DataFrame(out_info_dict).to_csv(args.out_info_file, index=False)
+        
+    if args.fasta_dir is not None:
+        os.makedirs(args.out_dir, exist_ok=True)
+        proteins = sorted(os.listdir(args.fasta_dir))
+        bar = tqdm(proteins)
+        for p in bar:
+            name = p[:-6]
+            bar.set_description(name)
+            out_file = os.path.join(args.out_dir, name+".pdb")
+            if os.path.exists(out_file):
+                continue
+            bar.set_description(p)
+            sequence = read_fasta(os.path.join(args.fasta_dir, p), "seq")
+            tokenized_input = tokenizer([sequence], return_tensors="pt", add_special_tokens=False)['input_ids'].cuda()
+            # Multimer prediction can be done with chains separated by ':'
+
+            with torch.no_grad():
+                output = model(tokenized_input)
+
+            pdb = convert_outputs_to_pdb(output)
+            with open(out_file, "w") as f:
+                f.write("\n".join(pdb))
+
+            struct = bsio.load_structure(out_file, extra_fields=["b_factor"])
+            print(p, struct.b_factor.mean())
+    elif args.sequence is not None:
+        sequence = args.sequence
+        # Multimer prediction can be done with chains separated by ':'
+
+        with torch.no_grad():
+            output = model.infer_pdb(sequence)
+
+        with open(args.out_file, "w") as f:
+            f.write(output)
+
+        struct = bsio.load_structure(args.out_file, extra_fields=["b_factor"])
+        print(struct.b_factor.mean())
