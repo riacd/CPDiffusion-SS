@@ -1,5 +1,11 @@
 # Secondary Structure-Guided Novel Protein Sequence Generation with Latent Graph Diffusion
 
+<div align="center" style="display: flex; justify-content: center; flex-wrap: wrap;">
+  <a href="https://github.com/riacd/CPDiffusion-SS"><img src="https://img.shields.io/static/v1?label=Source Code&message=Github&color=blue&logo=github"></a> &ensp;
+  <a href="https://huggingface.co/riacd/CPDiffusion-SS"><img src="https://img.shields.io/static/v1?label=Model Weight&message=Huggingface&color=yellow&logo=huggingface"></a> &ensp;
+  <a href="https://arxiv.org/abs/2407.07443"><img src="https://img.shields.io/static/v1?label=Paper&message=Arxiv&color=red&logo=arxiv"></a> &ensp;
+</div>
+
 ## 🚀 Introduction (CPDiffusion-SS)
 
 CPDiffusion-SS is composed of three primary components: a sequence encoder, a latent diffusion generator, and an autoregressive decoder. 
@@ -103,11 +109,11 @@ see README.md in "./baselines" for more details
     ProstT5: https://github.com/mheinzinger/ProstT5
 
     ProteinMPNN: https://github.com/dauparas/ProteinMPNN
-2. unzip source code under directory "./baselines"
+2. unzip source code to directory "baselines/"
 
 
 ### Experiments
-#### package installation
+#### Environment Setup
 ```shell
  conda install -c conda-forge -c bioconda mmseqs2 -y
  conda install -c conda-forge -c bioconda foldseek -y
@@ -115,29 +121,28 @@ see README.md in "./baselines" for more details
  conda install -c conda-forge pymol-open-source -y
 ```
 
+#### Weights Download
+Download checkpoints from [huggingface repository](https://huggingface.co/riacd/CPDiffusion-SS)
+```bash
+huggingface-cli download --resume-download riacd/CPDiffusion-SS
+```
+Move decoder model weights to directory "results/decoder/ckpt/"
+
+Move diffusion model weights to directory "results/diffusion/weight/"
+
 #### Run
 ```shell
 python metrics.py
 ```
 
-[//]: # (## 🙌 Citation)
+## 🙌 Citation
 
-[//]: # ()
-[//]: # (Please cite our work if you have used our code or data.)
-
-[//]: # ()
-[//]: # (```)
-
-[//]: # (@article{tan2024ses-adapter,)
-
-[//]: # (  title={Simple, Efficient and Scalable Structure-aware Adapter Boosts Protein Language Models},)
-
-[//]: # (  author={Tan, Yang and Li, Mingchen and Zhou, Bingxin and Zhong, Bozitao and Zheng, Lirong and Tan, Pan and Zhou, Ziyi and Yu, Huiqun and Fan, Guisheng and Hong, Liang},)
-
-[//]: # (  journal={arXiv preprint arXiv:2404.14850},)
-
-[//]: # (  year={2024})
-
-[//]: # (})
-
-[//]: # (``)
+Please cite our work if you have used our code or data.
+```
+@article{hu2024cpdiffusion-ss,
+  title={Secondary Structure-Guided Novel Protein Sequence Generation with Latent Graph Diffusion},
+  author={Yutong Hu, Yang Tan, Andi Han, Lirong Zheng, Liang Hong, Bingxin Zhou},
+  journal={arXiv preprint arXiv:2407.07443},
+  year={2024}
+}
+```
