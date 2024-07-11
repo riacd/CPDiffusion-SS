@@ -1,5 +1,11 @@
 # Secondary Structure-Guided Novel Protein Sequence Generation with Latent Graph Diffusion
 
+<div align="center" style="display: flex; justify-content: center; flex-wrap: wrap;">
+  <a href="https://github.com/riacd/CPDiffusion-SS"><img src="https://img.shields.io/static/v1?label=Source Code&message=Github&color=blue&logo=github"></a> &ensp;
+  <a href="https://huggingface.co/riacd/CPDiffusion-SS"><img src="https://img.shields.io/static/v1?label=Model Weight&message=Huggingface&color=yellow&logo=huggingface"></a> &ensp;
+  <a href="https://doi.org/10.1109/BIBM62325.2024.10822117"><img src="https://img.shields.io/static/v1?label=Paper&message=DOI&color=red&logo=doi"></a> &ensp;
+</div>
+
 ## 🚀 Introduction (CPDiffusion-SS)
 
 CPDiffusion-SS is composed of three primary components: a sequence encoder, a latent diffusion generator, and an autoregressive decoder. 
@@ -9,13 +15,16 @@ The sequence encoder embeds AA sequences into a latent space of secondary struct
 
 ## 📑 Results
 
-[//]: # (### News)
+### News
 
-[//]: # ()
-[//]: # (- [2024.06.29] our paper was accepted by ICMLw 2024 )
+- [2024.06.29] our paper was presented ICMLw 2024 
+- [2024.10.14] our paper was accepted as a regular paper at BIBM 2024
 
 ### Paper Results
-we compare CPDiffusion-SS with both sequence and structure-based baseline methods on 10 evaluation metrics concerning the diversity, novelty, and consistency of the generated sequences. CPDiffusion0SS outperforms baseline methods on 9 out of the 10 metrics, except for the TM_new.
+we compare CPDiffusion-SS with both sequence and structure-based baseline methods on 10 evaluation metrics concerning the diversity, novelty, and consistency of the generated sequences.
+CPDiffusion-SS outperforms all baselines in consistency while maintaining high diversity and novelty.
+<img src="img/result.png" alt="Logo">
+
 
 ### Case Study
 Predicted 3D structures and composition of secondary structures on three cases from the test dataset. 
@@ -91,23 +100,9 @@ args:
 | ID_max        | Consistency       | highest identities in secondary structure sequences between generated proteins and the target       |
 | MSE           | Consistency       | average MSE in secondary structure compositions between generated proteins and the target     |
 
-### Baselines
-#### ESM2 & ESM-IF1
-```shell
-pip install fair-esm
-```
-see README.md in "./baselines" for more details
-#### ProstT5 & ProteinMPNN
-1. download source code and checkpoint files from official repositories
-
-    ProstT5: https://github.com/mheinzinger/ProstT5
-
-    ProteinMPNN: https://github.com/dauparas/ProteinMPNN
-2. unzip source code under directory "./baselines"
-
 
 ### Experiments
-#### package installation
+#### Environment Setup
 ```shell
  conda install -c conda-forge -c bioconda mmseqs2 -y
  conda install -c conda-forge -c bioconda foldseek -y
@@ -115,29 +110,30 @@ see README.md in "./baselines" for more details
  conda install -c conda-forge pymol-open-source -y
 ```
 
+#### Weights Download
+Download checkpoints from [huggingface repository](https://huggingface.co/riacd/CPDiffusion-SS)
+```bash
+huggingface-cli download --resume-download riacd/CPDiffusion-SS
+```
+Move decoder model weights to directory "results/decoder/ckpt/"
+
+Move diffusion model weights to directory "results/diffusion/weight/"
+
 #### Run
 ```shell
 python metrics.py
 ```
 
-[//]: # (## 🙌 Citation)
+## 🙌 Citation
 
-[//]: # ()
-[//]: # (Please cite our work if you have used our code or data.)
-
-[//]: # ()
-[//]: # (```)
-
-[//]: # (@article{tan2024ses-adapter,)
-
-[//]: # (  title={Simple, Efficient and Scalable Structure-aware Adapter Boosts Protein Language Models},)
-
-[//]: # (  author={Tan, Yang and Li, Mingchen and Zhou, Bingxin and Zhong, Bozitao and Zheng, Lirong and Tan, Pan and Zhou, Ziyi and Yu, Huiqun and Fan, Guisheng and Hong, Liang},)
-
-[//]: # (  journal={arXiv preprint arXiv:2404.14850},)
-
-[//]: # (  year={2024})
-
-[//]: # (})
-
-[//]: # (``)
+Please cite our work if you have used our code or data.
+```
+@inproceedings{hu2024secondary,
+  title={Secondary structure-guided novel protein sequence generation with latent graph diffusion},
+  author={Hu, Yutong and Tan, Yang and Han, Andi and Zheng, Lirong and Hong, Liang and Zhou, Bingxin},
+  booktitle={2024 IEEE International Conference on Bioinformatics and Biomedicine (BIBM)},
+  pages={31--41},
+  year={2024},
+  organization={IEEE}
+}
+```

@@ -13,16 +13,13 @@ import numpy as np
 from tqdm import tqdm
 import random
 import esm
-import esm.inverse_folding
 import re
 import csv
-import pymol
-from pymol import cmd
 import pickle
 import networkx as nx
 from transformers import EsmModel, EsmConfig, AutoTokenizer, EsmForMaskedLM, EsmTokenizer
-from torch_geometric.data import Data
-from Bio import SeqIO
+# from torch_geometric.data import Data
+from Bio import SeqIO, PDB, SeqRecord, Seq
 from Bio.PDB.PDBParser import PDBParser
 from Bio.PDB.PDBIO import PDBIO
 from Bio.PDB.DSSP import DSSP
@@ -51,6 +48,11 @@ class ProtDiffConfig:
     embedding_dim: str
     diff_dp: str
     noise_schedule: str
+    type: str = "ss-condition"
+
+@dataclass
+class RFdiffusionConfig:
+    name: str = 'RFdiffusion'
     type: str = "ss-condition"
 
 @dataclass
@@ -84,6 +86,10 @@ class ESM2Config:
     mask_ratio: float = 0.2
     type: str = 'PLM'
 
+@dataclass
+class ESM3Config:
+    name: str = 'esm_3'
+    type: str = "variable_length" # or "ss-condition" to use fixed length design
 
 @dataclass
 class prostT5Config:
@@ -96,6 +102,30 @@ class ProteinMPNNConfig:
     name: str = 'ProteinMPNN'
     ckpt: str = os.path.join('baselines', 'ProteinMPNN', 'vanilla_model_weights')
     type: str = "IF"
+
+def extract_sequence_from_pdb(pdb_file):
+    """
+    Extracts amino acid sequences from a PDB file.
+
+    Args:
+    - pdb_file (str): Path to the PDB file.
+
+    Prints:
+    - Amino acid sequences for each chain in the PDB file.
+    """
+    # 创建PDB解析器对象
+    parser = PDB.PDBParser()
+
+    # 解析PDB文件
+    structure = parser.get_structure("MyStructure", pdb_file)
+
+    # 遍历模型、链和残基，提取氨基酸序列
+    model = structure[0]
+    ppb = PDB.PPBuilder()
+    pp = ppb.build_peptides(model)
+
+    sequence = pp[0].get_sequence()
+    return str(sequence)
 
 
 @dataclass
@@ -263,7 +293,8 @@ class PathConfig:
         self.plddt_filter_structure_dir = os.path.join(self.design_dir, 'plddt_filter_structures')
         self.design_filter_structure_dir = os.path.join(self.design_dir, 'design_filter_structures')
         self.ss_dir = os.path.join(self.design_dir, 'second_structures')
-        self.tmp_base = os.path.join(self.design_dir, 'tmp')
+        self.tmp_base = os.path.join(self.design_dir, 'tmp')    # this dir saves itermediate results and will be cleaned
+        self.intermediate_base = os.path.join(self.design_dir, 'intermediate')   # this dir saves important itermediate results and will not be cleaned
         # benchmark_pipeline
         self.metrics_dir = os.path.join(self.base_dir, 'metrics')
         self.esmfold_metrics_dir = os.path.join(self.metrics_dir, 'esmfold_metrics')
@@ -315,11 +346,13 @@ class DesignPipeline(PathConfig):
         self.restart = restart
         self.fold_continue = fold_continue
         # rename special input model
-        if self.model_config.type == "IF" or self.model_config.type == "PLM" or self.model_config.type == 'foldseek_PLM':
+        if self.model_config.type == "IF" or self.model_config.type == "PLM" or self.model_config.type == 'foldseek_PLM' or self.model_config.type == 'variable_length':
             # extra process for IF/PLM model input
             self.model_name += f"_{self.model_config.type}"
+            self.model_config.name = self.model_name
         print('Model config:', model_config.__dict__)
 
+        self.intermediate_dir = os.path.join(self.intermediate_base, self.model_name)
         self.tmp_dir = os.path.join(self.tmp_base, self.model_name)
         self.foldseek_dir = os.path.join(self.foldseek_base, self.model_name)
         self.clean_dirs([self.tmp_dir, self.foldseek_dir])
@@ -328,7 +361,6 @@ class DesignPipeline(PathConfig):
         self.load_log()
         self.data_list = self.select_sample_set()
 
-    @staticmethod
     def progress_control(pipeline_process):
         """
         (This is a decorator)
@@ -362,7 +394,7 @@ class DesignPipeline(PathConfig):
         self.esmfold(length_filter=length_filter)
         self.dssp_annotation()
 
-    @progress_control
+    @ progress_control
     def model_init(self):
         if re.match('prostT5', self.model_name):
             # save sample_3di.fasta to test_set dir as prostT5 input
@@ -444,6 +476,26 @@ class DesignPipeline(PathConfig):
             offset += ss_len
         return "".join(masked_seq)
 
+    @staticmethod
+    def get_ss_seq(aa_feature, ss3=True, variable_length=True):
+        """
+        get sequence of secondary structures (not secondary structure elements)
+        """
+        ss_seq = ""
+        ss_type_num = 3 if ss3 else 8
+        for ss_index, ss_type in enumerate(aa_feature[f"ss{ss_type_num}_seq"]):
+            wildtype_length = len(aa_feature[f"ss{ss_type_num}_to_aa"][ss_index])
+            if variable_length: # this setting is based on the statistics of ss3
+                if ss_type == 'H':  # length of helix should be over 3
+                    length = random.randint(3, max(3, 2 * wildtype_length))
+                else:   # "E" OR "C"
+                    length = random.randint(1, max(1, 2 * wildtype_length))
+            else:
+                length = wildtype_length
+            ss_seq += ss_type*length
+        return ss_seq
+
+
     @progress_control
     def seq_generation(self):
         """
@@ -479,6 +531,8 @@ class DesignPipeline(PathConfig):
             print('running command:', command)
             ret = subprocess.run(command, shell=True, encoding="utf-8", check=True)
         elif re.match('esm_if', self.model_name):
+            import esm.inverse_folding
+
             device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
             for pdb_file in tqdm(self.data_list, desc='sample'):
                 pdb_path = os.path.join(args.data_root, self.benchmark_config.test_set, 'pdb', pdb_file)
@@ -497,6 +551,8 @@ class DesignPipeline(PathConfig):
                     with open(out_path, 'w') as f:
                         f.write('>' + seq_name + '_' + str(num) + '\n' + sampled_seq)
         elif re.match('prostT5', self.model_name):
+            import esm.inverse_folding
+
             for pdb_file in self.data_list:
                 pdb_file_path = os.path.join(args.data_root, self.benchmark_config.test_set, 'pdb', pdb_file)
                 seq_name = pdb_file.split('.')[-2]
@@ -561,6 +617,8 @@ class DesignPipeline(PathConfig):
                     out_path = os.path.join(out_dir, out_file)
                     SeqIO.write(record, out_path, "fasta-2line")
         elif re.match('esm_2', self.model_name):
+            import esm.inverse_folding
+
             def random_mask(seq, ratio=0.2):
                 """
                 Randomly mask characters in a string based on the given mask ratio.
@@ -632,7 +690,149 @@ class DesignPipeline(PathConfig):
             command = ' '.join(command)
             print('running command:', command)
             ret = subprocess.run(command, shell=True, encoding="utf-8", check=True)
+        elif re.match('RFdiffusion', self.model_name):
+            # step 1: run ss_adj_script in RFdiffsuion repo to get target_ss.pt & target_adj.pt
+            # step 2: run rfdiffusion_script to generate monomer backbone
+            # step 3: generate sequences using ProteinMPNN
 
+            # configurations
+            RF_num = 20 # number of RFdiffusion designs for each template
+            MPNN_num = 10 # number of PorteinMPNN designs for each RF pdb
+            current_step = 3    # start from current_step
+
+            # STEP 1
+            # example: python ./helper_scripts/make_secstruc_adj.py --input_pdb ./2KL8.pdb --out_dir ./adj_ss
+            if current_step <= 1:
+                selected_pdb_dir = os.path.join(self.tmp_dir, 'pdb')
+                os.makedirs(selected_pdb_dir, exist_ok=True)
+                # overwrite ss adj dir
+                ss_adj_dir = os.path.join(self.intermediate_dir, 'ss_adj')
+                self.clean_dirs(ss_adj_dir)
+                for pdb_file in tqdm(self.data_list, desc='get test pdb files'):
+                    pdb_path = os.path.join(args.data_root, self.benchmark_config.test_set, 'pdb', pdb_file)
+                    cp_path = os.path.join(selected_pdb_dir, pdb_file)
+                    shutil.copy(pdb_path, cp_path)
+                ss_adj_script = os.path.join('baselines', 'RFdiffusion', 'helper_scripts', 'make_secstruc_adj.py')
+                command = ['python', ss_adj_script]
+                command.extend(['--pdb_dir', str(selected_pdb_dir)])
+                command.extend(['--out_dir', str(ss_adj_dir)])
+
+                command = ' '.join(command)
+                result = subprocess.run(command, shell=True, encoding="utf-8", check=True)
+
+            # STEP 2
+            # example: python ./scripts/run_inference.py inference.output_prefix=./outputs/2KL8 scaffoldguided.scaffoldguided=True scaffoldguided.target_pdb=False scaffoldguided.scaffold_dir=./helper_scripts/adj_ss scaffoldguided.target_ss=./helper_scripts/adj_ss/2KL8_ss.pt scaffoldguided.target_adj=./helper_scripts/adj_ss/2KL8_adj.pt inference.num_designs=2
+            rf_pdbs = os.path.join(self.intermediate_dir, 'rf_pdbs')
+            os.makedirs(rf_pdbs, exist_ok=True)
+            if current_step <= 2:
+                # not overwrite
+                rfdiffusion_script = os.path.join('baselines', 'RFdiffusion', 'scripts', 'run_inference.py')
+                command_fixed = ['python', rfdiffusion_script]
+                command_fixed.extend([f'scaffoldguided.scaffoldguided=True'])
+                command_fixed.extend([f'scaffoldguided.target_pdb=False'])
+                command_fixed.extend([f'scaffoldguided.scaffold_dir={str(ss_adj_dir)}'])
+
+                for pdb_file in tqdm(self.data_list, desc='get RFdiffusion pdb files'):
+                    pdb_name = pdb_file.split('.')[0]
+                    command_variable = []
+                    command_variable.extend([f'inference.output_prefix={str(os.path.join(rf_pdbs, pdb_name))}'])
+                    command_variable.extend([f'inference.num_designs={str(RF_num)}'])
+
+                    command = command_fixed + command_variable
+                    command = ' '.join(command)
+                    result = subprocess.run(command, shell=True, encoding="utf-8", check=False)
+
+
+
+            # STEP 3
+            if current_step <= 3:
+                # copy RFdiffusion generated final pdb files only for ProteinMPNN
+                ProteinMPNN_inputs = os.path.join(self.intermediate_dir, 'ProteinMPNN_inputs')
+                self.clean_dirs(ProteinMPNN_inputs)
+                for pdb_file in os.listdir(rf_pdbs):
+                    pdb_file_path = os.path.join(rf_pdbs, pdb_file)
+                    if os.path.isfile(pdb_file_path):
+                        if pdb_file.split('.')[-1] == 'pdb':
+                            shutil.copy(pdb_file_path, ProteinMPNN_inputs)
+
+                ProteinMPNN_outputs = os.path.join(self.intermediate_dir, "ProteinMPNN_outputs")
+                ProteinMPNN_script = os.path.join('baselines', 'ProteinMPNN', 'protein_mpnn_run.py')
+                command_fixed = ['python', ProteinMPNN_script]
+                command_fixed.extend(['--path_to_model_weights', os.path.join('baselines', 'ProteinMPNN', 'ca_model_weights')])
+                command_fixed.extend(['--num_seq_per_target', str(MPNN_num)])
+                command_fixed.extend(['--ca_only'])
+                command_fixed.extend(['--out_folder', ProteinMPNN_outputs.replace("\\", "/").split(":")[-1]])    # proteinMPNN script cannot correctly process windows path
+
+                pdb_files = os.listdir(ProteinMPNN_inputs)
+                for pdb_file in tqdm(pdb_files, desc='ProteinMPNN Sample'):
+                    pdb_path = os.path.join(ProteinMPNN_inputs, pdb_file)
+                    command_variable = ['--pdb_path', pdb_path.replace("\\", "/").split(":")[-1]]
+
+                    command = command_fixed + command_variable
+                    command_str = ' '.join(command)
+                    print('running command:', command_str)
+                    result = subprocess.run(command_str, shell=True, encoding="utf-8", check=True)
+                    # result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+
+                # convert ProteinMPNN output fasta
+                proteinMPNN_out_path = os.path.join(ProteinMPNN_outputs, 'seqs')
+                proteinMPNN_out_files = os.listdir(proteinMPNN_out_path)
+                seq_records = dict()
+                for proteinMPNN_out_file in proteinMPNN_out_files:
+                    rf_pdb_name = proteinMPNN_out_file.split('.')[0]
+                    template_name = rf_pdb_name.split('_')[0]
+                    if template_name not in seq_records.keys():
+                        seq_records[template_name] =  list()
+                        # the first record of seq_records[template_name] is the wildtype sequence of template pdb
+                        template_pdb_path = os.path.join(args.data_root, self.benchmark_config.test_set, 'pdb', template_name+'.pdb')
+                        original_seq = extract_sequence_from_pdb(template_pdb_path)
+                        first_record = SeqRecord.SeqRecord(Seq.Seq(original_seq), id = f"{template_name}_original", description="")
+                        seq_records[template_name].append(first_record)
+
+                    # read records from ProteinMPNN output
+                    file_path = os.path.join(proteinMPNN_out_path, proteinMPNN_out_file)
+                    with open(file_path, 'r') as f:
+                        records = list(SeqIO.parse(f, "fasta"))
+                    assert len(records) == MPNN_num + 1     # records[0] is the sequence of input pdb
+
+                    for i, record in enumerate(records[1:]):
+                        record.id = template_name+'_'+str(len(seq_records[template_name])-1)
+                        record.description = ''
+                        seq_records[template_name].append(record)
+
+                for template_name, records in seq_records.items():
+                    for record in records:
+                        out_file = record.id + '.fasta'
+                        out_path = os.path.join(out_dir, out_file)
+                        SeqIO.write(record, out_path, "fasta-2line")
+        elif re.match('esm_3', self.model_name):
+            from esm.models.esm3 import ESM3
+            from esm.sdk.api import ESM3InferenceClient, ESMProtein, GenerationConfig
+            os.environ["DISABLE_ITERATIVE_SAMPLING_TQDM"] = "True"
+            # This will download the model weights and instantiate the model on your machine.
+            model: ESM3InferenceClient = ESM3.from_pretrained("esm3_sm_open_v1")
+            # Note: Here I manualy edited esm package to make ESM3 SecondaryStructureTokenizer to "ss3" kind (default is "ss8")
+
+            for pdb_file in tqdm(self.data_list, desc='sample'):
+                # pdb_file_path = os.path.join(args.data_root, self.benchmark_config.test_set, 'pdb', pdb_file)
+                aa_feature_file_path = os.path.join(args.data_root, self.benchmark_config.test_set, 'aa_feature', pdb_file.replace(".pdb", ".pt"))
+                seq_name = pdb_file.split('.')[-2]
+                out_path = os.path.join(out_dir, seq_name + '_original.fasta')
+                # original_seq = extract_sequence_from_pdb(pdb_file_path)
+                aa_feature = torch.load(aa_feature_file_path)
+                original_seq = aa_feature['aa_seq']
+
+                with open(out_path, 'w') as f:
+                    f.write('>' + seq_name + '_original' + '\n' + original_seq)
+                for num in tqdm(range(int(self.benchmark_config.sample_num))):
+                    out_path = os.path.join(out_dir, seq_name + '_' + str(num) + '.fasta')
+                    ss3_seq = self.get_ss_seq(aa_feature, variable_length=self.model_config.type == "variable_length")
+                    protein = ESMProtein(secondary_structure=ss3_seq)
+                    # Generate the sequence, then the structure. This will iteratively unmask the sequence track.
+                    protein = model.generate(protein, GenerationConfig(track="sequence", num_steps=8, temperature=1))
+                    sampled_seq = protein.sequence
+                    with open(out_path, 'w') as f:
+                        f.write('>' + seq_name + '_' + str(num) + '\n' + sampled_seq)
         else:
             raise ValueError(f'invalid model name: {self.model_name}')
 
@@ -778,8 +978,6 @@ class DesignPipeline(PathConfig):
                     if ret:
                         shutil.copy(os.path.join(in_dir, template, file), output_dir)
 
-            # gen = pymol.cmd.get_ob
-            # result = pymol.cmd.align()
 
     @progress_control
     def dssp_annotation(self):
@@ -1007,16 +1205,8 @@ class BenchmarkPipeline(DesignPipeline, MetricsCalculation):
         self.foldability()
         self.designability()
         self.novelty()
-        self.novelty_add_std()
         self.variance()
         self.diversity()
-
-
-    def add_std(self):
-        self.log["designability"] = "undone"
-        self.designability()
-        self.novelty_add_std()
-        self.diversity_add_std()
 
     def design(self, plddt_threshold=0.7):
         super().run()
@@ -1024,7 +1214,6 @@ class BenchmarkPipeline(DesignPipeline, MetricsCalculation):
         self.design_filter(plddt_threshold=plddt_threshold)
 
 
-    @staticmethod
     def progress_control(pipeline_process):
         return DesignPipeline.progress_control(pipeline_process)
 
@@ -1246,8 +1435,8 @@ class BenchmarkPipeline(DesignPipeline, MetricsCalculation):
             json.dump(designability_raw_remove_loop, f)
         with open(os.path.join(out_dir, 'designability_remove_loop.json'), 'w') as f:
             json.dump(designability_remove_loop, f)
-            with open(os.path.join(out_dir, 'designability.json'), 'w') as f:
-                json.dump(designability, f)
+        with open(os.path.join(out_dir, 'avg_designability_remove_loop.json'), 'w') as f:
+            json.dump(avg_list_remove_loop, f)
 
         # draw pie chart with matplotlib.pyplot (global statistics: statistics across all templates)
         # self.draw_ss_statistics()
@@ -1330,32 +1519,10 @@ class BenchmarkPipeline(DesignPipeline, MetricsCalculation):
             new_avg_list[data_type + '_std'] = np.array(avg_list[data_type]).std().item()
             print(data_type, new_avg_list[data_type])
             print(data_type + '_std', new_avg_list[data_type + '_std'])
-
         with open(os.path.join(out_dir, 'diversity.json'), 'w') as f:
             json.dump(diversity, f)
         with open(os.path.join(out_dir, 'avg_diversity.json'), 'w') as f:
             json.dump(new_avg_list, f)
-
-    def diversity_add_std(self):
-        out_dir = os.path.join(self.esmfold_metrics_dir, self.model_name)
-        with open(os.path.join(out_dir, 'diversity.json'), 'r') as f:
-            diversity = json.load(f)
-        new_avg_list = dict()
-        avg_list = dict()
-        for template, data in diversity.items():
-            for data_type, data_num in data.items():
-                if data_type not in avg_list.keys():
-                    avg_list[data_type] = list()
-                if not np.isnan(data_num):
-                    avg_list[data_type].append(data_num)
-        for data_type in avg_list.keys():
-            new_avg_list[data_type] = np.array(avg_list[data_type]).mean().item()
-            new_avg_list[data_type + '_std'] = np.array(avg_list[data_type]).std().item()
-            print(data_type, new_avg_list[data_type])
-            print(data_type + '_std', new_avg_list[data_type + '_std'])
-        with open(os.path.join(out_dir, 'avg_diversity.json'), 'w') as f:
-            json.dump(new_avg_list, f)
-
 
     @progress_control
     def novelty(self, folding_model='ESMFOLD'):
@@ -1417,22 +1584,10 @@ class BenchmarkPipeline(DesignPipeline, MetricsCalculation):
             json.dump(align_closest, f)
         with open(os.path.join(out_dir, 'novelty.json'), 'w') as f:
             avg_TM_score = np.array(avg_TM_score_list).mean().item()
-            print('average TM score between generated structure and its closest strcuture in training set: ', avg_TM_score)
-            json.dump({'avg_TM_score': avg_TM_score}, f)
-        self.clean_dirs(self.foldseek_dir)
-
-    def novelty_add_std(self):
-        out_dir = os.path.join(self.esmfold_metrics_dir, self.model_name)
-        avg_TM_score_list = list()
-        with open(os.path.join(out_dir, 'novelty_align.json'), 'r') as f:
-            align_closest = json.load(f)
-        for query, info in align_closest.items():
-            avg_TM_score_list.append(info['tm_score'])
-        with open(os.path.join(out_dir, 'novelty.json'), 'w') as f:
-            avg_TM_score = np.array(avg_TM_score_list).mean().item()
             avg_TM_score_std = np.array(avg_TM_score_list).std().item()
             print('average TM score between generated structure and its closest strcuture in training set: ', avg_TM_score, avg_TM_score_std)
             json.dump({'avg_TM_score': avg_TM_score, 'avg_TM_score_std': avg_TM_score_std}, f)
+        self.clean_dirs(self.foldseek_dir)
 
     def designability_plot(self):
         print('Designability: ')
@@ -1993,7 +2148,6 @@ class BenchmarkAnalysis:
             # 保存公用雷达图
             plt.savefig(os.path.join(self.outdir, "radar_chart_all.png"))
 
-    @staticmethod
     def multi_design(analysis_func):
         """
         (This is a decorator)
@@ -2149,6 +2303,9 @@ class BenchmarkAnalysis:
 
     @staticmethod
     def pymol_align_matrix(design_pdb, target_pdb):
+        import pymol
+        from pymol import cmd
+
         # 启动PyMOL
         cmd.reinitialize()
 
@@ -2178,17 +2335,17 @@ class BenchmarkAnalysis:
 
     @staticmethod
     def pymol_show(path):
-        # 初始化 PyMOL
+        import pymol
+        from pymol import cmd
+
         pymol.finish_launching()
 
-        # 加载 PDB 文件
         if type(path) is str:
             cmd.load(path)
         elif type(path) is list:
             for path_ in path:
                 cmd.load(path_)
 
-        # 显示加载的结构
         cmd.show('cartoon')
 
     @staticmethod
@@ -2398,6 +2555,8 @@ if __name__ == '__main__':
     # settings
     args = create_parser()
     print(args)
+    RFdiffusion = RFdiffusionConfig()
+    ESM3 = ESM3Config()
     ProtDiffS40 = ProtDiffConfig(
         name='protdiff_2nd_S40',
         diff_ckpt='results/diffusion/weight/diffusion_CATH43S40_SPLIT.pt',
@@ -2421,58 +2580,63 @@ if __name__ == '__main__':
         encoder_type='AttentionPooling',
         type="encoder_embedding"
     )
-    if torch.cuda.is_available():
-        ESMIF = ESMIFConfig(
-            name='esm_if1_gvp4_t16_142M_UR50',
-            model=esm.pretrained.esm_if1_gvp4_t16_142M_UR50()[0].eval().cuda()
-        )
-        esm_2_model = EsmForMaskedLM.from_pretrained(args.ESM2_dir)
-        esm_2_model.cuda()
-        esm_2_model.eval()
-    else:
-        ESMIF = ESMIFConfig(
-            name='esm_if1_gvp4_t16_142M_UR50',
-            model=esm.pretrained.esm_if1_gvp4_t16_142M_UR50()[0].eval()
-        )
-        esm_2_model = EsmForMaskedLM.from_pretrained(args.ESM2_dir).eval()
-        esm_2_model.eval()
-    esm_2_name = "esm_2"
-    ESM2 = ESM2Config(
-        name=esm_2_name,
-        model=esm_2_model,
-        tokenizer=AutoTokenizer.from_pretrained(args.ESM2_dir),
-        mask_ratio=0)
-    prostT5 = prostT5Config()
-    proteinMPNN = ProteinMPNNConfig()
-
-    esm_2_name = "esm_2_"+f"ratio_{str(0.6).replace('.', '')}"
-    ESM2_ratio_06 = ESM2Config(
-        name=esm_2_name,
-        model=esm_2_model,
-        tokenizer=AutoTokenizer.from_pretrained(args.ESM2_dir),
-        mask_ratio=0.6,
-        type="random_mask"
-    )
-    
-    esm_2_name = "esm_2_"+f"ratio_{str(0.8).replace('.', '')}"
-    ESM2_ratio_08 = ESM2Config(
-        name=esm_2_name,
-        model=esm_2_model,
-        tokenizer=AutoTokenizer.from_pretrained(args.ESM2_dir),
-        mask_ratio=0.8,
-        type="random_mask"
-    )
-
-    esm_2_name = "esm_2_"+f"ratio_{str(0.1).replace('.', '')}"
-    ESM2_ratio_01 = ESM2Config(
-        name=esm_2_name,
-        model=esm_2_model,
-        tokenizer=AutoTokenizer.from_pretrained(args.ESM2_dir),
-        mask_ratio=0.1,
-        type="random_mask"
-    )
+    # if torch.cuda.is_available():
+    #     ESMIF = ESMIFConfig(
+    #         name='esm_if1_gvp4_t16_142M_UR50',
+    #         model=esm.pretrained.esm_if1_gvp4_t16_142M_UR50()[0].eval().cuda()
+    #     )
+    #     esm_2_model = EsmForMaskedLM.from_pretrained(args.ESM2_dir)
+    #     esm_2_model.cuda()
+    #     esm_2_model.eval()
+    # else:
+    #     ESMIF = ESMIFConfig(
+    #         name='esm_if1_gvp4_t16_142M_UR50',
+    #         model=esm.pretrained.esm_if1_gvp4_t16_142M_UR50()[0].eval()
+    #     )
+    #     esm_2_model = EsmForMaskedLM.from_pretrained(args.ESM2_dir).eval()
+    #     esm_2_model.eval()
+    # esm_2_name = "esm_2"
+    # ESM2 = ESM2Config(
+    #     name=esm_2_name,
+    #     model=esm_2_model,
+    #     tokenizer=AutoTokenizer.from_pretrained(args.ESM2_dir),
+    #     mask_ratio=0)
+    # prostT5 = prostT5Config()
+    # proteinMPNN = ProteinMPNNConfig()
+    #
+    # esm_2_name = "esm_2_"+f"ratio_{str(0.6).replace('.', '')}"
+    # ESM2_ratio_06 = ESM2Config(
+    #     name=esm_2_name,
+    #     model=esm_2_model,
+    #     tokenizer=AutoTokenizer.from_pretrained(args.ESM2_dir),
+    #     mask_ratio=0.6,
+    #     type="random_mask"
+    # )
+    #
+    # esm_2_name = "esm_2_"+f"ratio_{str(0.8).replace('.', '')}"
+    # ESM2_ratio_08 = ESM2Config(
+    #     name=esm_2_name,
+    #     model=esm_2_model,
+    #     tokenizer=AutoTokenizer.from_pretrained(args.ESM2_dir),
+    #     mask_ratio=0.8,
+    #     type="random_mask"
+    # )
+    #
+    # esm_2_name = "esm_2_"+f"ratio_{str(0.1).replace('.', '')}"
+    # ESM2_ratio_01 = ESM2Config(
+    #     name=esm_2_name,
+    #     model=esm_2_model,
+    #     tokenizer=AutoTokenizer.from_pretrained(args.ESM2_dir),
+    #     mask_ratio=0.1,
+    #     type="random_mask"
+    # )
 
     # run
+    benchmark_config = BenchmarkConfig()
+    benchmark_pipeline = BenchmarkPipeline(ESM3, benchmark_config=benchmark_config)
+    benchmark_pipeline.run()
+    exit(0)
+
     # ESM-2 pipeline
     # esm_2_ratios=[0.1, 0.15, 0.2, 0.3, 0.4, 0.6, 0.8]
     # for esm_2_ratio in esm_2_ratios:
@@ -2484,9 +2648,10 @@ if __name__ == '__main__':
     #         mask_ratio=esm_2_ratio
     #         type="random_mask"
     #     )
-    #     benchmark_config = BenchmarkConfig(test_num='50', sample_num='40')
+    #     benchmark_config = BenchmarkConfig(test_num='50', sample_num='200')
     #     benchmark_pipeline = BenchmarkPipeline(ESM2, benchmark_config=benchmark_config)
     #     benchmark_pipeline.run()
+
 
 
 
@@ -2502,10 +2667,10 @@ if __name__ == '__main__':
     # 2024.5.19
     # analyze benchmark
     # model_configs = [ESM2_ratio_08]
-    benchmark_config = BenchmarkConfig()
+    # benchmark_config = BenchmarkConfig()
     # model_configs = [ProtDiffS40, prostT5, ESM2, proteinMPNN, ESM2_ratio_06, ESM2_ratio_08, ESMIF]
-    model_configs = [ProtDiffS40, prostT5, proteinMPNN, ESMIF]  # for case study
-    benchmark_analysis = BenchmarkAnalysis(model_configs=model_configs, args=args, benchmark_config=benchmark_config)
+    # model_configs = [ProtDiffS40, prostT5, proteinMPNN, ESMIF]  # for case study
+    # benchmark_analysis = BenchmarkAnalysis(model_configs=model_configs, args=args, benchmark_config=benchmark_config)
     # global figure
     # benchmark_analysis.ss_composition()
     # benchmark_analysis.aa_composition()
