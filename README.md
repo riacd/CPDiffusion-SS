@@ -15,10 +15,10 @@ The sequence encoder embeds AA sequences into a latent space of secondary struct
 
 ## 📑 Results
 
-[//]: # (### News)
+### News
 
-[//]: # ()
-[//]: # (- [2024.06.29] our paper was accepted by ICMLw 2024 )
+- [2024.06.29] our paper was presented ICMLw 2024 
+- [2024.10.14] our paper was accepted as a regular paper at BIBM 2024 (we'll update our results with baselines RoseTTAFold and ESM3 soon)
 
 ### Paper Results
 we compare CPDiffusion-SS with both sequence and structure-based baseline methods on 10 evaluation metrics concerning the diversity, novelty, and consistency of the generated sequences. CPDiffusion0SS outperforms baseline methods on 9 out of the 10 metrics, except for the TM_new.

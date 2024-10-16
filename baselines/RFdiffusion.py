@@ -1,0 +1,1 @@
+# python ./scripts/run_inference.py inference.output_prefix=./outputs/2KL8 scaffoldguided.scaffoldguided=True scaffoldguided.target_pdb=False scaffoldguided.scaffold_dir=./helper_scripts/adj_ss scaffoldguided.target_ss=./helper_scripts/adj_ss/2KL8_ss.pt scaffoldguided.target_adj=./helper_scripts/adj_ss/2KL8_adj.pt inference.num_designs=2
